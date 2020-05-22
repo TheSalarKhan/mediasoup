@@ -1,5 +1,30 @@
 # Changelog
 
+### 3.5.13
+
+* Simplify `GetDesiredBitrate()` in `SimulcastConsumer` and `SvcConsumer`.
+* Update libuv to 1.38.0.
+
+
+### 3.5.12
+
+* `SeqManager.cpp`: Improve performance.
+  - PR #398 (credits to @penguinol).
+
+
+### 3.5.11
+
+* `SeqManager.cpp`: Fix a bug and improve performance.
+  - Fixes issue #395 via PR #396 (credits to @penguinol).
+* Drop Node.js 8 support. Minimum supported Node.js version is now 10.
+* Upgrade `eslint` and `jest` major versions.
+
+
+### 3.5.10
+
+* `SimulcastConsumer.cpp`: Fix `IncreaseLayer()` method (fixes #394).
+* Udpate Node deps.
+
 
 ### 3.5.9
 
