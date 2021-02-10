@@ -4,10 +4,19 @@ import { EnhancedEventEmitter } from './EnhancedEventEmitter';
 import * as utils from './utils';
 import * as ortc from './ortc';
 import { Channel } from './Channel';
+import { PayloadChannel } from './PayloadChannel';
 import { Producer, ProducerOptions } from './Producer';
 import { Consumer, ConsumerOptions } from './Consumer';
-import { DataProducer, DataProducerOptions } from './DataProducer';
-import { DataConsumer, DataConsumerOptions } from './DataConsumer';
+import {
+	DataProducer,
+	DataProducerOptions,
+	DataProducerType
+} from './DataProducer';
+import {
+	DataConsumer,
+	DataConsumerOptions,
+	DataConsumerType
+} from './DataConsumer';
 import { RtpCapabilities } from './RtpParameters';
 import { SctpParameters, SctpStreamParameters } from './SctpParameters';
 
@@ -93,6 +102,9 @@ export class Transport extends EnhancedEventEmitter
 	// Channel instance.
 	protected readonly _channel: Channel;
 
+	// PayloadChannel instance.
+	protected readonly _payloadChannel: PayloadChannel;
+
 	// Close flag.
 	protected _closed = false;
 
@@ -150,6 +162,7 @@ export class Transport extends EnhancedEventEmitter
 			internal,
 			data,
 			channel,
+			payloadChannel,
 			appData,
 			getRouterRtpCapabilities,
 			getProducerById,
@@ -159,6 +172,7 @@ export class Transport extends EnhancedEventEmitter
 			internal: any;
 			data: any;
 			channel: Channel;
+			payloadChannel: PayloadChannel;
 			appData: any;
 			getRouterRtpCapabilities: () => RtpCapabilities;
 			getProducerById: (producerId: string) => Producer;
@@ -173,6 +187,7 @@ export class Transport extends EnhancedEventEmitter
 		this._internal = internal;
 		this._data = data;
 		this._channel = channel;
+		this._payloadChannel = payloadChannel;
 		this._appData = appData;
 		this._getRouterRtpCapabilities = getRouterRtpCapabilities;
 		this._getProducerById = getProducerById;
@@ -239,6 +254,7 @@ export class Transport extends EnhancedEventEmitter
 
 		// Remove notification subscriptions.
 		this._channel.removeAllListeners(this._internal.transportId);
+		this._payloadChannel.removeAllListeners(this._internal.transportId);
 
 		this._channel.request('transport.close', this._internal)
 			.catch(() => {});
@@ -300,6 +316,7 @@ export class Transport extends EnhancedEventEmitter
 
 		// Remove notification subscriptions.
 		this._channel.removeAllListeners(this._internal.transportId);
+		this._payloadChannel.removeAllListeners(this._internal.transportId);
 
 		// Close every Producer.
 		for (const producer of this._producers.values())
@@ -473,7 +490,8 @@ export class Transport extends EnhancedEventEmitter
 			{
 				internal,
 				data,
-				channel : this._channel,
+				channel        : this._channel,
+				payloadChannel : this._payloadChannel,
 				appData,
 				paused
 			});
@@ -504,6 +522,7 @@ export class Transport extends EnhancedEventEmitter
 			rtpCapabilities,
 			paused = false,
 			preferredLayers,
+			pipe = false,
 			appData = {}
 		}: ConsumerOptions
 	): Promise<Consumer>
@@ -516,7 +535,7 @@ export class Transport extends EnhancedEventEmitter
 			throw new TypeError('if given, appData must be an object');
 
 		// This may throw.
-		ortc.validateRtpCapabilities(rtpCapabilities);
+		ortc.validateRtpCapabilities(rtpCapabilities!);
 
 		const producer = this._getProducerById(producerId);
 
@@ -525,18 +544,21 @@ export class Transport extends EnhancedEventEmitter
 
 		// This may throw.
 		const rtpParameters = ortc.getConsumerRtpParameters(
-			producer.consumableRtpParameters, rtpCapabilities);
+			producer.consumableRtpParameters, rtpCapabilities!, pipe);
 
 		// Set MID.
-		rtpParameters.mid = `${this._nextMidForConsumers++}`;
-
-		// We use up to 8 bytes for MID (string).
-		if (this._nextMidForConsumers === 100000000)
+		if (!pipe)
 		{
-			logger.error(
-				`consume() | reaching max MID value "${this._nextMidForConsumers}"`);
+			rtpParameters.mid = `${this._nextMidForConsumers++}`;
 
-			this._nextMidForConsumers = 0;
+			// We use up to 8 bytes for MID (string).
+			if (this._nextMidForConsumers === 100000000)
+			{
+				logger.error(
+					`consume() | reaching max MID value "${this._nextMidForConsumers}"`);
+
+				this._nextMidForConsumers = 0;
+			}
 		}
 
 		const internal = { ...this._internal, consumerId: uuidv4(), producerId };
@@ -544,7 +566,7 @@ export class Transport extends EnhancedEventEmitter
 		{
 			kind                   : producer.kind,
 			rtpParameters,
-			type                   : producer.type,
+			type                   : pipe ? 'pipe' : producer.type,
 			consumableRtpEncodings : producer.consumableRtpParameters.encodings,
 			paused,
 			preferredLayers
@@ -553,13 +575,19 @@ export class Transport extends EnhancedEventEmitter
 		const status =
 			await this._channel.request('transport.consume', internal, reqData);
 
-		const data = { kind: producer.kind, rtpParameters, type: producer.type };
+		const data =
+		{
+			kind : producer.kind,
+			rtpParameters,
+			type : pipe ? 'pipe' : producer.type
+		};
 
 		const consumer = new Consumer(
 			{
 				internal,
 				data,
 				channel         : this._channel,
+				payloadChannel  : this._payloadChannel,
 				appData,
 				paused          : status.paused,
 				producerPaused  : status.producerPaused,
@@ -587,7 +615,7 @@ export class Transport extends EnhancedEventEmitter
 			label = '',
 			protocol = '',
 			appData = {}
-		}: DataProducerOptions
+		}: DataProducerOptions = {}
 	): Promise<DataProducer>
 	{
 		logger.debug('produceData()');
@@ -597,11 +625,36 @@ export class Transport extends EnhancedEventEmitter
 		else if (appData && typeof appData !== 'object')
 			throw new TypeError('if given, appData must be an object');
 
-		// This may throw.
-		ortc.validateSctpStreamParameters(sctpStreamParameters);
+		let type: DataProducerType;
+
+		// If this is not a DirectTransport, sctpStreamParameters are required.
+		if (this.constructor.name !== 'DirectTransport')
+		{
+			type = 'sctp';
+
+			// This may throw.
+			ortc.validateSctpStreamParameters(sctpStreamParameters!);
+		}
+		// If this is a DirectTransport, sctpStreamParameters must not be given.
+		else
+		{
+			type = 'direct';
+
+			if (sctpStreamParameters)
+			{
+				logger.warn(
+					'produceData() | sctpStreamParameters are ignored when producing data on a DirectTransport');
+			}
+		}
 
 		const internal = { ...this._internal, dataProducerId: id || uuidv4() };
-		const reqData = { sctpStreamParameters, label, protocol };
+		const reqData =
+		{
+			type,
+			sctpStreamParameters,
+			label,
+			protocol
+		};
 
 		const data =
 			await this._channel.request('transport.produceData', internal, reqData);
@@ -610,7 +663,8 @@ export class Transport extends EnhancedEventEmitter
 			{
 				internal,
 				data,
-				channel : this._channel,
+				channel        : this._channel,
+				payloadChannel : this._payloadChannel,
 				appData
 			});
 
@@ -635,6 +689,9 @@ export class Transport extends EnhancedEventEmitter
 	async consumeData(
 		{
 			dataProducerId,
+			ordered,
+			maxPacketLifeTime,
+			maxRetransmits,
 			appData = {}
 		}: DataConsumerOptions
 	): Promise<DataConsumer>
@@ -651,19 +708,60 @@ export class Transport extends EnhancedEventEmitter
 		if (!dataProducer)
 			throw Error(`DataProducer with id "${dataProducerId}" not found`);
 
-		const sctpStreamParameters =
-			utils.clone(dataProducer.sctpStreamParameters) as SctpStreamParameters;
+		let type: DataConsumerType;
+		let sctpStreamParameters: SctpStreamParameters | undefined;
+		let sctpStreamId: number;
+
+		// If this is not a DirectTransport, use sctpStreamParameters from the
+		// DataProducer (if type 'sctp') unless they are given in method parameters.
+		if (this.constructor.name !== 'DirectTransport')
+		{
+			type = 'sctp';
+			sctpStreamParameters =
+				utils.clone(dataProducer.sctpStreamParameters) as SctpStreamParameters;
+
+			// Override if given.
+			if (ordered !== undefined)
+				sctpStreamParameters.ordered = ordered;
+
+			if (maxPacketLifeTime !== undefined)
+				sctpStreamParameters.maxPacketLifeTime = maxPacketLifeTime;
+
+			if (maxRetransmits !== undefined)
+				sctpStreamParameters.maxRetransmits = maxRetransmits;
+
+			// This may throw.
+			sctpStreamId = this._getNextSctpStreamId();
+
+			this._sctpStreamIds![sctpStreamId] = 1;
+			sctpStreamParameters.streamId = sctpStreamId;
+		}
+		// If this is a DirectTransport, sctpStreamParameters must not be used.
+		else
+		{
+			type = 'direct';
+
+			if (
+				ordered !== undefined ||
+				maxPacketLifeTime !== undefined ||
+				maxRetransmits !== undefined
+			)
+			{
+				logger.warn(
+					'consumeData() | ordered, maxPacketLifeTime and maxRetransmits are ignored when consuming data on a DirectTransport');
+			}
+		}
 
 		const { label, protocol } = dataProducer;
 
-		// This may throw.
-		const sctpStreamId = this._getNextSctpStreamId();
-
-		this._sctpStreamIds[sctpStreamId] = 1;
-		sctpStreamParameters.streamId = sctpStreamId;
-
 		const internal = { ...this._internal, dataConsumerId: uuidv4(), dataProducerId };
-		const reqData = { sctpStreamParameters, label, protocol };
+		const reqData =
+		{
+			type,
+			sctpStreamParameters,
+			label,
+			protocol
+		};
 
 		const data =
 			await this._channel.request('transport.consumeData', internal, reqData);
@@ -672,7 +770,8 @@ export class Transport extends EnhancedEventEmitter
 			{
 				internal,
 				data,
-				channel : this._channel,
+				channel        : this._channel,
+				payloadChannel : this._payloadChannel,
 				appData
 			});
 
@@ -681,13 +780,15 @@ export class Transport extends EnhancedEventEmitter
 		{
 			this._dataConsumers.delete(dataConsumer.id);
 
-			this._sctpStreamIds[sctpStreamId] = 0;
+			if (this._sctpStreamIds)
+				this._sctpStreamIds[sctpStreamId] = 0;
 		});
 		dataConsumer.on('@dataproducerclose', () =>
 		{
 			this._dataConsumers.delete(dataConsumer.id);
 
-			this._sctpStreamIds[sctpStreamId] = 0;
+			if (this._sctpStreamIds)
+				this._sctpStreamIds[sctpStreamId] = 0;
 		});
 
 		// Emit observer event.
